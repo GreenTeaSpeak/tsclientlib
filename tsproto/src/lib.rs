@@ -53,7 +53,12 @@ const MAX_FRAGMENTS_LENGTH: usize = 40960;
 
 /// The maximum number of packets which are stored, if they are received
 /// out-of-order.
-const MAX_QUEUE_LEN: u16 = 200;
+///
+/// On large servers with hundreds of clients, the initial channel/client list
+/// sync can burst well over 200 command packets; a single dropped packet in
+/// that burst would otherwise abort the connection before the server's
+/// retransmit could catch up.
+const MAX_QUEUE_LEN: u16 = 4096;
 
 /// The maximum decompressed size of a packet.
 #[allow(clippy::unreadable_literal)]
