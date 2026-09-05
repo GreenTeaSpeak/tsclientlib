@@ -2,7 +2,7 @@
 `tsproto-structs` contains machine readable data for several TeamSpeak related topics.
 
 The underlying data files can be found in the
-[tsdeclarations](https://github.com/ReSpeak/tsdeclarations) repository.
+[tsdeclarations](https://github.com/GreenTeaSpeak/tsdeclarations) repository.
 
 ## License
 Licensed under either of
@@ -11,3 +11,4 @@ Licensed under either of
  * [MIT license](../../LICENSE-MIT)
 
 at your option.
+

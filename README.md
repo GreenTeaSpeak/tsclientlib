@@ -25,7 +25,7 @@ client, which is based on this library (but it is not ready yet).
 An example of a simple chat bot can be found [here](https://github.com/ReSpeak/SimpleBot).
 
 ## Clone
-This repository embeds the [declarations](https://github.com/ReSpeak/tsdeclarations) as submodule. You can clone with
+This repository embeds the [declarations](https://github.com/GreenTeaSpeak/tsdeclarations) as submodule. You can clone with
 ```
 git clone https://github.com/ReSpeak/tsclientlib.git --recurse-submodules
 ```
@@ -64,7 +64,7 @@ The utils folder contains smaller building blocks for the library.
 
 - `ts-bookkeeping`: This crates keeps book of the currently connected clients and channels of a server.
 - `tsproto-packets`: Parse packets and commands.
-- `tsproto-structs`: Contains parsed versions of the [tsdeclarations](https://github.com/ReSpeak/tsdeclarations).
+- `tsproto-structs`: Contains parsed versions of the [tsdeclarations](https://github.com/GreenTeaSpeak/tsdeclarations).
 - `tsproto-types`: Contains basic types for TeamSpeak, e.g. versions and error codes.
 
 ## How this works
@@ -75,7 +75,7 @@ all these low-level things.
 
 The convenient client library on top is `tsclientlib`. It uses all the versions,
 messages, structures and errors which are written down in a
-[machine readable format](https://github.com/ReSpeak/tsdeclarations) and
+[machine readable format](https://github.com/GreenTeaSpeak/tsdeclarations) and
 provides a nice and safe api.
 
 ## Performance
@@ -113,3 +113,4 @@ Licensed under either of
  * [MIT license](LICENSE-MIT)
 
 at your option.
+

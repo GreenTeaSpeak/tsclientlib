@@ -1,7 +1,7 @@
 //! `tsproto-structs` contains machine readable data for several TeamSpeak related topics.
 //!
 //! The underlying data files can be found in the
-//! [tsdeclarations](https://github.com/ReSpeak/tsdeclarations) repository.
+//! [tsdeclarations](https://github.com/GreenTeaSpeak/tsdeclarations) repository.
 
 use std::fmt;
 use std::str::FromStr;
@@ -396,3 +396,4 @@ pub fn unindent(s: &mut String) {
 
 /// Returns an empty string if `s` is empty, otherwise `s` with braces.
 pub fn embrace(s: &str) -> String { if s.is_empty() { String::new() } else { format!("({})", s) } }
+
