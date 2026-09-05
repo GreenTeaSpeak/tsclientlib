@@ -15,11 +15,13 @@ use rand::RngExt;
 use rug::Integer;
 #[cfg(feature = "rug")]
 use rug::integer::Order;
+use num_traits::FromPrimitive;
 use thiserror::Error;
 use time::OffsetDateTime;
 use tracing::{info, warn};
 use tsproto_packets::commands::{CommandItem, CommandParser};
 use tsproto_packets::packets::*;
+use tsproto_types::LicenseType;
 use tsproto_types::crypto::{EccKeyPrivEd25519, EccKeyPrivP256, EccKeyPubEd25519, EccKeyPubP256};
 
 use crate::algorithms as algs;
@@ -75,13 +77,16 @@ pub enum Error {
 pub struct Client {
 	con: Connection,
 	pub private_key: EccKeyPrivP256,
+	/// When true, `clientinitiv` includes `teaspeak=1` (required by TeaSpeak /
+	/// GreenTeaSpeak before they answer with `initivexpand2`).
+	pub teaspeak: bool,
 }
 
 impl Client {
 	pub fn new(
 		address: SocketAddr, udp_socket: Box<dyn Socket + Send>, private_key: EccKeyPrivP256,
 	) -> Self {
-		Self { con: Connection::new(true, address, udp_socket), private_key }
+		Self { con: Connection::new(true, address, udp_socket), private_key, teaspeak: false }
 	}
 
 	async fn get_init(&mut self, init_steps: &[u8]) -> Result<InS2CInitBuf> {
@@ -248,7 +253,7 @@ impl Client {
 		// Random bytes
 		let random0 = rand::rng().random::<[u8; 4]>();
 
-		let alpha;
+		let mut alpha;
 		loop {
 			// Wait for Init1
 			{
@@ -292,10 +297,24 @@ impl Client {
 
 						// Create clientinitiv
 						alpha = rand::rng().random::<[u8; 10]>();
+						// TeaSpeak docs: Bit0 of alpha[0] must be set.
+						if self.teaspeak {
+							alpha[0] |= 0x01;
+						}
 						// omega is an ASN.1-DER encoded public key from
 						// the ECDH parameters.
 
-						let ip = self.con.address.ip();
+						let ip = if self.teaspeak {
+							// GreenTeaSpeak / TeaSpeak expect `ip=unknown`.
+							"unknown".to_string()
+						} else {
+							let ip = self.con.address.ip();
+							if crate::utils::is_global_ip(&ip) {
+								ip.to_string()
+							} else {
+								String::new()
+							}
+						};
 
 						let x = **x;
 						let n = **n;
@@ -330,15 +349,19 @@ impl Client {
 						// omega is an ASN.1-DER encoded public key from
 						// the ECDH parameters.
 						let omega = self.private_key.to_pub().to_tomcrypt();
-						let ip = if crate::utils::is_global_ip(&ip) {
-							ip.to_string()
-						} else {
-							String::new()
-						};
 
 						// Send next init packet
 						self.send_packet(OutC2SInit4::new(
-							version, &x, &n, level, &random2, &y, &alpha, &omega, &ip,
+							version,
+							&x,
+							&n,
+							level,
+							&random2,
+							&y,
+							&alpha,
+							&omega,
+							&ip,
+							self.teaspeak,
 						))?;
 					}
 					_ => {
@@ -352,11 +375,110 @@ impl Client {
 			break;
 		}
 
-		let clientek_id;
 		{
 			let command = self.get_command().await?;
 
 			let (name, args) = CommandParser::new(command.data().packet().content());
+			if name == b"error" {
+				return Err(Error::UnexpectedPacket(
+					"initivexpand",
+					format!(
+						"server rejected crypto setup ({})",
+						String::from_utf8_lossy(command.data().packet().content())
+					),
+				));
+			}
+
+			if name == b"initivexpand" {
+				// Classic TeaSpeak / GreenTeaSpeak path (after `-teaspeak` switch).
+				let mut alpha_reply = None;
+				let mut beta_vec = None;
+				let mut server_key = None;
+				let mut teaspeak = false;
+				let mut license_type = None;
+				for item in args {
+					match item {
+						CommandItem::NextCommand => {
+							return Err(Error::MultipleCommands("initivexpand"));
+						}
+						CommandItem::Argument(arg) => match arg.name() {
+							b"alpha" => {
+								alpha_reply = Some(
+									BASE64_STANDARD
+										.decode(arg.value().get())
+										.map_err(|e| Error::InvalidBase64Arg("alpha", e))?,
+								)
+							}
+							b"beta" => {
+								beta_vec = Some(
+									BASE64_STANDARD
+										.decode(arg.value().get())
+										.map_err(|e| Error::InvalidBase64Arg("beta", e))?,
+								)
+							}
+							b"omega" => {
+								server_key = Some(
+									EccKeyPubP256::from_ts(
+										&arg.value().get_str().map_err(Error::InvalidOmegaString)?,
+									)
+									.map_err(Error::InvalidOmegaKey)?,
+								)
+							}
+							b"teaspeak" => {
+								teaspeak = arg.value().get_raw().is_empty()
+									|| arg.value().get_raw() == b"1"
+							}
+							b"license" => {
+								if let Ok(s) = arg.value().get_str() {
+									if let Ok(n) = s.parse::<u8>() {
+										if let Some(lt) = LicenseType::from_u8(n) {
+											license_type = Some(lt);
+										}
+									}
+								}
+							}
+							b"lt" => {
+								if license_type.is_none() {
+									if let Ok(s) = arg.value().get_str() {
+										if let Ok(n) = s.parse::<u8>() {
+											if let Some(lt) = LicenseType::from_u8(n) {
+												license_type = Some(lt);
+											}
+										}
+									}
+								}
+							}
+							_ => {}
+						},
+					}
+				}
+				let alpha_reply = alpha_reply.ok_or(Error::InvalidInitivexpand2)?;
+				let beta_vec = beta_vec.ok_or(Error::InvalidInitivexpand2)?;
+				let server_key = server_key.ok_or(Error::InvalidInitivexpand2)?;
+				if alpha_reply.as_slice() != alpha.as_slice() {
+					return Err(Error::UnexpectedPacket(
+						"initivexpand",
+						"alpha key miss match".into(),
+					));
+				}
+				if beta_vec.len() != 10 {
+					return Err(Error::InvalidBetaLength(beta_vec.len()));
+				}
+				let mut beta = [0u8; 10];
+				beta.copy_from_slice(&beta_vec);
+				let (iv, mac, iv_len) = algs::compute_iv_mac_teaspeak(
+					&alpha,
+					&beta,
+					self.private_key.clone(),
+					server_key.clone(),
+				);
+				let mut params = ConnectedParams::new(server_key, iv, mac, iv_len);
+				params.teaspeak = teaspeak || self.teaspeak;
+				params.license_type = license_type;
+				self.con.params = Some(params);
+				return Ok(());
+			}
+
 			if name != b"initivexpand2" {
 				return Err(Error::UnexpectedPacket(
 					"initivexpand2",
@@ -370,6 +492,7 @@ impl Client {
 			let mut proof = None;
 			let mut ot = false;
 			let mut root = None;
+			let mut teaspeak = false;
 			for item in args {
 				match item {
 					CommandItem::NextCommand => {
@@ -406,6 +529,7 @@ impl Client {
 							)
 						}
 						b"ot" => ot = arg.value().get_raw() == b"1",
+						b"teaspeak" => teaspeak = arg.value().get_raw() == b"1",
 						b"root" => {
 							let data = BASE64_STANDARD
 								.decode(arg.value().get())
@@ -446,6 +570,8 @@ impl Client {
 
 			// Parse license argument
 			let licenses = Licenses::parse(l).map_err(Error::ParseLicense)?;
+			// Classic TS3: license type lives in the Server/Ts5Server block of `l=`.
+			let license_type = licenses.server_license_type();
 			// Ephemeral key of server
 			let server_ek = licenses.derive_public_key(root).map_err(Error::ParseLicense)?;
 
@@ -453,7 +579,10 @@ impl Client {
 			let ek = EccKeyPrivEd25519::create();
 
 			let (iv, mac) = algs::compute_iv_mac(&alpha, &beta, &ek, &server_ek);
-			self.con.params = Some(ConnectedParams::new(server_key, iv, mac));
+			let mut params = ConnectedParams::new(server_key, iv, mac, 64);
+			params.teaspeak = teaspeak;
+			params.license_type = license_type;
+			self.con.params = Some(params);
 
 			// Send clientek
 			let ek_pub = ek.to_pub();
@@ -466,14 +595,13 @@ impl Client {
 			let proof = self.private_key.clone().sign(&all);
 			let proof_s = BASE64_STANDARD.encode(&proof);
 
-			// Send clientek
 			let mut cmd =
 				OutCommand::new(Direction::C2S, Flags::empty(), PacketType::Command, "clientek");
 			cmd.write_arg("ek", &ek_s);
 			cmd.write_arg("proof", &proof_s);
-			clientek_id = self.send_packet(cmd.into_packet())?;
+			let clientek_id = self.send_packet(cmd.into_packet())?;
+			self.wait_for_ack(clientek_id).await?;
 		}
-		self.wait_for_ack(clientek_id).await?;
 
 		Ok(())
 	}
@@ -943,7 +1071,7 @@ mod tests {
 				PartialPacketId { generation_id: 0, packet_id: 1 };
 
 			// Set params
-			let mut params = ConnectedParams::new(other_key, [0; 64], [0x42; 8]);
+			let mut params = ConnectedParams::new(other_key, [0; 64], [0x42; 8], 64);
 			params.c_id = 1;
 			con.params = Some(params);
 		}

@@ -164,6 +164,22 @@ impl Licenses {
 
 	pub fn parse(data: Vec<u8>) -> Result<Self> { Self::parse_internal(data, true) }
 
+	/// License type from the first `Server` / `Ts5Server` block in the chain.
+	///
+	/// Classic TeamSpeak 3 sends this chain as `l=` in `initivexpand2` and often
+	/// omits `license` / `lt` from `initserver`.
+	pub fn server_license_type(&self) -> Option<LicenseType> {
+		let mut offset = 1;
+		for block in &self.blocks {
+			let data = &self.data[offset..offset + block.len];
+			if let Ok(lt) = block.get_license_type(data) {
+				return Some(lt);
+			}
+			offset += block.len;
+		}
+		None
+	}
+
 	pub fn parse_internal(data: Vec<u8>, check_expired: bool) -> Result<Self> {
 		let version = data[0];
 		if version != 0 && version != 1 {
@@ -869,6 +885,39 @@ mod tests {
 			dGVtcyBHbWJIAACvTQIgpv6zmLZq3znh7ygmOSokGFkFjz4bTigrOnetrgIJdIIACdS\
 			/gAYAAAAAU29zc2VuU3lzdGVtcy5iaWQAADY7+uV1CQ1niOvYSdGzsu83kPTNWijovr\
 			3B78eHGeePIAm98vQJvpu0").unwrap()).unwrap();
+	}
+
+	#[test]
+	fn aal_license_exposes_server_license_type() {
+		let licenses = Licenses::parse_ignore_expired(
+			BASE64_STANDARD
+				.decode(
+					"AQCvbHFTQDY/terPeilrp/ECU9xCH5U3xC92lY\
+			TNaY/0KQAJFueAazbsgAAAACVUZWFtU3BlYWsgU3lzdGVtcyBHbWJIAABhl9gwla/UJ\
+			p2Eszst9TRVXO/PeE6a6d+CTI6Pg7OEVgAJc5CrL4Nh8gAAACRUZWFtU3BlYWsgc3lz\
+			dGVtcyBHbWJIAACvTQIgpv6zmLZq3znh7ygmOSokGFkFjz4bTigrOnetrgIJdIIACdS\
+			/gAYAAAAAU29zc2VuU3lzdGVtcy5iaWQAADY7+uV1CQ1niOvYSdGzsu83kPTNWijovr\
+			3B78eHGeePIAm98vQJvpu0",
+				)
+				.unwrap(),
+		)
+		.unwrap();
+		assert_eq!(licenses.server_license_type(), Some(LicenseType::Aal));
+	}
+
+	#[test]
+	fn standard_license_exposes_default_license_type() {
+		let licenses = Licenses::parse_ignore_expired(
+			BASE64_STANDARD
+				.decode(
+					"AQA1hUFJiiSs0wFXkYuPUJVcDa6XCrZTcsvkB0\
+			Ffzz4CmwIITRXgCqeTYAcAAAAgQW5vbnltb3VzAACiIBip9hQaK6P3QhwOJs/BkPn0i\
+			oyIDPaNgzJ6M8x0kiAJf4hxCYAxMQ==",
+				)
+				.unwrap(),
+		)
+		.unwrap();
+		assert_eq!(licenses.server_license_type(), Some(LicenseType::Default));
 	}
 
 	#[test]

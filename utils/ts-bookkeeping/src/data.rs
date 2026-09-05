@@ -47,8 +47,18 @@ macro_rules! copy_attrs {
 }
 
 impl Connection {
-	pub fn new(public_key: EccKeyPubP256, msg: &s2c::InInitServer) -> Self {
+	pub fn new(
+		public_key: EccKeyPubP256, msg: &s2c::InInitServer, early_license: Option<LicenseType>,
+	) -> Self {
 		let packet = msg.iter().next().unwrap();
+		// TeaSpeak / GreenTeaSpeak: prefer `license`, then `lt` (same as GTS client).
+		// Fallback: value from crypto handshake (`initivexpand` lt/license, or
+		// classic TS3 `initivexpand2` license chain Server/Ts5Server block).
+		let license = packet
+			.license
+			.or(packet.license_type)
+			.or(early_license)
+			.unwrap_or(LicenseType::NoLicense);
 		Self {
 			own_client: packet.client_id,
 			server: copy_attrs!(packet, Server;
@@ -83,8 +93,7 @@ impl Connection {
 				id: packet.virtual_server_id,
 				public_key: public_key,
 				ips: packet.ips.clone().unwrap_or_default(),
-				// TODO Get from license struct
-				license: LicenseType::NoLicense,
+				license: license,
 
 				optional_data: None,
 				connection_data: None,
@@ -345,6 +354,24 @@ impl Connection {
 		};
 		Ok((ch, ch_fam))
 	}
+
+	/// TeaSpeak `notifychannelshow` — same fields as create, but mostly optional.
+	fn max_clients_csh_fun(
+		&self, msg: &s2c::InChannelShowPart, _: &mut Vec<Event>,
+	) -> Result<(Option<MaxClients>, Option<MaxClients>)> {
+		let ch = max_clients!(msg);
+		let ch_fam = if msg.is_max_family_clients_unlimited.unwrap_or_default() {
+			Some(MaxClients::Unlimited)
+		} else if msg.inherits_max_family_clients.unwrap_or_default() {
+			Some(MaxClients::Inherited)
+		} else if msg.max_family_clients.map(|i| i >= 0 && i <= u16::MAX as i32).unwrap_or_default()
+		{
+			Some(MaxClients::Limited(msg.max_family_clients.unwrap() as u16))
+		} else {
+			None
+		};
+		Ok((ch, ch_fam))
+	}
 	fn max_clients_ce_fun(
 		&mut self, channel_id: ChannelId, msg: &s2c::InChannelEditedPart, events: &mut Vec<Event>,
 	) -> Result<()> {
@@ -415,6 +442,12 @@ impl Connection {
 		Ok(Self::channel_flags_to_type(msg.is_permanent, msg.is_semi_permanent))
 	}
 
+	fn channel_type_csh_fun(
+		&self, msg: &s2c::InChannelShowPart, _: &mut Vec<Event>,
+	) -> Result<ChannelType> {
+		Ok(Self::channel_flags_to_type(msg.is_permanent, msg.is_semi_permanent))
+	}
+
 	fn channel_type_ce_fun(
 		&mut self, channel_id: ChannelId, msg: &s2c::InChannelEditedPart, events: &mut Vec<Event>,
 	) -> Result<()> {
@@ -451,6 +484,12 @@ impl Connection {
 
 	fn channel_codec_cc_fun(
 		&self, msg: &s2c::InChannelCreatedPart, _: &mut Vec<Event>,
+	) -> Result<Codec> {
+		Ok(msg.codec.unwrap_or(Codec::OpusVoice))
+	}
+
+	fn channel_codec_csh_fun(
+		&self, msg: &s2c::InChannelShowPart, _: &mut Vec<Event>,
 	) -> Result<Codec> {
 		Ok(msg.codec.unwrap_or(Codec::OpusVoice))
 	}
@@ -653,6 +692,27 @@ impl Connection {
 	) -> Result<ChannelId> {
 		self.channel_order_insert(msg.channel_id, msg.order, msg.parent_id, events);
 		Ok(msg.order)
+	}
+
+	fn channel_parent_csh_fun(
+		&self, msg: &s2c::InChannelShowPart, _: &mut Vec<Event>,
+	) -> Result<ChannelId> {
+		Ok(msg.parent_id.unwrap_or(ChannelId(0)))
+	}
+
+	fn channel_name_csh_fun(
+		&self, msg: &s2c::InChannelShowPart, _: &mut Vec<Event>,
+	) -> Result<String> {
+		Ok(msg.name.clone().unwrap_or_default())
+	}
+
+	fn channel_order_csh_fun(
+		&mut self, msg: &s2c::InChannelShowPart, events: &mut Vec<Event>,
+	) -> Result<ChannelId> {
+		let order = msg.order.unwrap_or(ChannelId(0));
+		let parent = msg.parent_id.unwrap_or(ChannelId(0));
+		self.channel_order_insert(msg.channel_id, order, parent, events);
+		Ok(order)
 	}
 
 	fn channel_order_ce_fun(

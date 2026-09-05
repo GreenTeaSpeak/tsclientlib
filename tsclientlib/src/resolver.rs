@@ -21,6 +21,8 @@ use tracing::{debug, instrument, warn};
 const DEFAULT_PORT: u16 = 9987;
 const DNS_PREFIX_TCP: &str = "_tsdns._tcp.";
 const DNS_PREFIX_UDP: &str = "_ts3._udp.";
+/// GreenTeaSpeak / TeaSpeak SRV prefix (queried in addition to `_ts3._udp`).
+const DNS_PREFIX_UDP_GTS: &str = "_gts._udp.";
 const NICKNAME_LOOKUP_ADDRESS: &str = "https://named.myteamspeak.com/lookup";
 /// Wait this amount of seconds before giving up.
 const TIMEOUT_SECONDS: u64 = 10;
@@ -68,10 +70,12 @@ enum ParseIpResult<'a> {
 
 /// Beware that this may be slow because it tries all available methods.
 ///
-/// The following methods are tried:
+/// The following methods are tried (aligned with GreenTeaSpeak):
 /// 1. If the address is an ip, the ip is returned
+/// 1. If an explicit `:port` is given on a hostname, SRV/TSDNS are skipped (Direct A/AAAA)
 /// 1. Server nicknames are resolved by a http request to TeamSpeak
-/// 1. The SRV record at `_ts3._udp.<address>`
+/// 1. SRV `_gts._udp.<host>` then `_gts._udp.<root>` (TeaSpeak / GreenTeaSpeak)
+/// 1. SRV `_ts3._udp.<host>` then `_ts3._udp.<root>`
 /// 1. The SRV record at `_tsdns._tcp.address.tld` to get the address of a tsdns
 ///    server, e.g. when the address is `ts3.subdomain.from.com`, the SRV record
 ///    at `_tsdns._tcp.from.com` is requested
@@ -99,79 +103,74 @@ pub fn resolve(address: String) -> impl Stream<Item = Result<SocketAddr>> {
 		Err(res) => return stream::once(future::err(res)).left_stream(),
 	}
 
-	// Resolve as nickname
-	let res = if !address.contains('.') && addr != "localhost" {
-		debug!("Resolving nickname");
-		// Could be a server nickname
-		resolve_nickname(address.clone())
-			.map_ok(move |mut addr| {
-				if let Some(port) = port {
-					addr.set_port(port);
-				}
-				addr
-			})
-			.left_stream()
-	} else {
-		stream::once(future::err(Error::InvalidNickname)).right_stream()
-	};
-
-	// The system config does not yet work on android:
-	// https://github.com/bluejekyll/trust-dns/issues/652
-	let addr2 = addr.clone();
-	// TODO Move current span into stream
-	let res = res.chain(
+	// Explicit host:port → Direct only (matches GreenTeaSpeak: skip slow SRV/TSDNS).
+	let res = if port.is_some() {
+		let addr_direct = addr.clone();
+		let port_direct = port.unwrap_or(DEFAULT_PORT);
 		stream::once(async move {
-			let resolver = create_resolver()?;
-
-			// Try to get the address by an SRV record
-			Result::<_>::Ok(resolve_srv(resolver, format!("{DNS_PREFIX_UDP}{addr2}.")))
-		})
-		.try_flatten(),
-	);
-
-	// Try to get the address of a tsdns server by an SRV record
-	let addr2 = addr.clone();
-	// TODO Move current span into stream
-	let res = res.chain(
-		stream::once(async move {
-			let resolver = create_resolver()?;
-			// Trim address to two components
-			let name = if let Some(i) = addr2.rfind('.').and_then(|i| addr2[..i].rfind('.')) {
-				&addr2[i + 1..]
-			} else {
-				&addr2
-			};
-			// Pick the first srv record of the first server that answers
-			Result::<_>::Ok(resolve_srv(resolver, format!("{DNS_PREFIX_TCP}{name}.")).and_then(
-				move |srv| {
-					let address = address.clone();
-					async move {
-						// Got tsdns server
-						let mut addr = resolve_tsdns(srv, &address).await?;
-						if let Some(port) = port {
-							// Overwrite port if it was specified
-							addr.set_port(port);
-						}
-						Ok(addr)
-					}
-				},
-			))
-		})
-		.try_flatten(),
-	);
-
-	// Interpret as normal address and resolve with system resolver
-	let res = res.chain(
-		stream::once(async move {
-			let res = net::lookup_host((addr.as_str(), port.unwrap_or(DEFAULT_PORT)))
+			let res = net::lookup_host((addr_direct.as_str(), port_direct))
 				.await
 				.map_err(Error::ResolveHost)?
 				.map(Ok)
 				.collect::<Vec<_>>();
 			Result::<_>::Ok(stream::iter(res))
 		})
-		.try_flatten(),
-	);
+		.try_flatten()
+		.left_stream()
+	} else {
+		// Resolve as nickname
+		let nick = if !address.contains('.') && addr != "localhost" {
+			debug!("Resolving nickname");
+			resolve_nickname(address.clone()).left_stream()
+		} else {
+			stream::once(future::err(Error::InvalidNickname)).right_stream()
+		};
+
+		// GreenTeaSpeak order: `_gts._udp` before `_ts3._udp`, and also query the
+		// registrable root (`ts.example.com` → also `example.com`).
+		let srv_hosts = srv_lookup_hosts(&addr);
+		let nick = nick.chain(resolve_srv_records(srv_hosts.clone(), DNS_PREFIX_UDP_GTS));
+		let nick = nick.chain(resolve_srv_records(srv_hosts, DNS_PREFIX_UDP));
+
+		// Try to get the address of a tsdns server by an SRV record
+		let addr2 = addr.clone();
+		let address_for_tsdns = address.clone();
+		let nick = nick.chain(
+			stream::once(async move {
+				let resolver = create_resolver()?;
+				// Trim address to two components
+				let name = if let Some(i) = addr2.rfind('.').and_then(|i| addr2[..i].rfind('.')) {
+					&addr2[i + 1..]
+				} else {
+					&addr2
+				};
+				Result::<_>::Ok(resolve_srv(resolver, format!("{DNS_PREFIX_TCP}{name}.")).and_then(
+					move |srv| {
+						let address = address_for_tsdns.clone();
+						async move {
+							let addr = resolve_tsdns(srv, &address).await?;
+							Ok(addr)
+						}
+					},
+				))
+			})
+			.try_flatten(),
+		);
+
+		// Interpret as normal address and resolve with system resolver
+		let nick = nick.chain(
+			stream::once(async move {
+				let res = net::lookup_host((addr.as_str(), DEFAULT_PORT))
+					.await
+					.map_err(Error::ResolveHost)?
+					.map(Ok)
+					.collect::<Vec<_>>();
+				Result::<_>::Ok(stream::iter(res))
+			})
+			.try_flatten(),
+		);
+		nick.right_stream()
+	};
 
 	// TODO Move current span into stream
 	tokio_stream::StreamExt::timeout(res, Duration::from_secs(TIMEOUT_SECONDS))
@@ -189,6 +188,40 @@ pub fn resolve(address: String) -> impl Stream<Item = Result<SocketAddr>> {
 			})
 		})
 		.right_stream()
+}
+
+/// Hosts to query for `_gts`/`_ts3` SRV: FQDN first, then the two-label root.
+fn srv_lookup_hosts(host: &str) -> Vec<String> {
+	let host = host.trim_end_matches('.').to_string();
+	if host.is_empty() || host == "localhost" {
+		return vec![host];
+	}
+	let parts: Vec<&str> = host.split('.').filter(|p| !p.is_empty()).collect();
+	if parts.len() <= 2 {
+		return vec![host];
+	}
+	let root = parts[parts.len() - 2..].join(".");
+	if root == host {
+		vec![host]
+	} else {
+		vec![host, root]
+	}
+}
+
+/// Resolve SRV for each host under `service` (e.g. `_gts._udp.`).
+fn resolve_srv_records(
+	hosts: Vec<String>, service: &'static str,
+) -> impl Stream<Item = Result<SocketAddr>> {
+	stream::iter(hosts)
+		.map(move |host| {
+			stream::once(async move {
+				let resolver = create_resolver()?;
+				debug!(%service, %host, "Trying SRV lookup");
+				Result::<_>::Ok(resolve_srv(resolver, format!("{service}{host}.")))
+			})
+			.try_flatten()
+		})
+		.flatten()
 }
 
 // Windows for some reason automatically adds a link-local address to the dns
@@ -341,8 +374,8 @@ pub async fn resolve_tsdns<A: net::ToSocketAddrs>(server: A, addr: &str) -> Resu
 }
 
 fn resolve_srv(resolver: TokioResolver, addr: String) -> impl Stream<Item = Result<SocketAddr>> {
-	stream::once(async {
-		let lookup = resolver.srv_lookup(addr).await.map_err(Error::SrvLookup)?;
+	stream::once(async move {
+		let lookup = resolver.srv_lookup(addr.clone()).await.map_err(Error::SrvLookup)?;
 		let srvs = lookup
 			.answers()
 			.iter()
@@ -352,44 +385,16 @@ fn resolve_srv(resolver: TokioResolver, addr: String) -> impl Stream<Item = Resu
 			})
 			.collect::<Vec<_>>();
 
-		let prios = srvs.iter().chunk_by(|srv| srv.priority);
-		let entries = prios.into_iter().sorted_by_key(|(p, _)| *p);
-
-		// Select by weight
-		let mut sorted_entries = Vec::new();
-		for (_, es) in entries {
-			let mut zero_entries = Vec::new();
-
-			// All non-zero entries
-			let mut entries = es
-				.filter_map(|e| {
-					if e.weight == 0 {
-						zero_entries.push(e);
-						None
-					} else {
-						Some(e)
-					}
-				})
-				.collect::<Vec<_>>();
-
-			while !entries.is_empty() {
-				let weight: u32 = entries.iter().map(|e| e.weight as u32).sum();
-				let mut w = rand::rng().random_range(0..=weight);
-				if w == 0 {
-					// Pick the first entry with weight 0
-					if let Some(i) = entries.iter().position(|e| e.weight == 0) {
-						sorted_entries.push(entries.remove(i));
-					}
-				}
-				for i in 0..entries.len() {
-					let weight = entries[i].weight as u32;
-					if w <= weight {
-						sorted_entries.push(entries.remove(i));
-						break;
-					}
-					w -= weight;
-				}
-			}
+		let sorted_entries = order_srv_by_priority_weight(&srvs);
+		for e in &sorted_entries {
+			debug!(
+				srv = %addr,
+				target = %e.target,
+				port = e.port,
+				priority = e.priority,
+				weight = e.weight,
+				"SRV hit"
+			);
 		}
 
 		let res = sorted_entries
@@ -409,6 +414,48 @@ fn resolve_srv(resolver: TokioResolver, addr: String) -> impl Stream<Item = Resu
 			.try_flatten())
 	})
 	.try_flatten()
+}
+
+/// RFC 2782: lower priority first; within a priority, pick by weight; weight 0
+/// records are selected only after all positive-weight records (but still used).
+fn order_srv_by_priority_weight(
+	srvs: &[hickory_net::proto::rr::rdata::SRV],
+) -> Vec<hickory_net::proto::rr::rdata::SRV> {
+	let prios = srvs.iter().chunk_by(|srv| srv.priority);
+	let entries = prios.into_iter().sorted_by_key(|(p, _)| *p);
+
+	let mut sorted_entries = Vec::new();
+	for (_, es) in entries {
+		let mut zero_entries = Vec::new();
+		let mut weighted = Vec::new();
+		for e in es {
+			if e.weight == 0 {
+				zero_entries.push(e.clone());
+			} else {
+				weighted.push(e.clone());
+			}
+		}
+
+		while !weighted.is_empty() {
+			let weight: u32 = weighted.iter().map(|e| e.weight as u32).sum();
+			let mut w = rand::rng().random_range(0..=weight);
+			let mut picked = None;
+			for i in 0..weighted.len() {
+				let ew = weighted[i].weight as u32;
+				if w <= ew {
+					picked = Some(i);
+					break;
+				}
+				w -= ew;
+			}
+			sorted_entries.push(weighted.remove(picked.unwrap_or(0)));
+		}
+
+		// Critical: GreenTeaSpeak (and many others) publish weight=0 only.
+		// Dropping these made SRV resolve to an empty list.
+		sorted_entries.extend(zero_entries);
+	}
+	sorted_entries
 }
 
 #[cfg(test)]
@@ -470,6 +517,53 @@ mod test {
 		assert!(parse_ip("127.0.0.1:65536").is_err());
 	}
 
+	#[test]
+	fn srv_lookup_hosts_full_then_root() {
+		assert_eq!(
+			srv_lookup_hosts("ts.greenteaspeak.de"),
+			vec!["ts.greenteaspeak.de".to_string(), "greenteaspeak.de".to_string()]
+		);
+		assert_eq!(
+			srv_lookup_hosts("greenteaspeak.de"),
+			vec!["greenteaspeak.de".to_string()]
+		);
+		assert_eq!(srv_lookup_hosts("localhost"), vec!["localhost".to_string()]);
+	}
+
+	#[test]
+	fn parse_hostname_with_port_skips_to_other() {
+		assert_eq!(
+			parse_ip("ts.greenteaspeak.de:9987").unwrap(),
+			ParseIpResult::Other("ts.greenteaspeak.de", Some(9987))
+		);
+	}
+
+	#[test]
+	fn order_srv_keeps_weight_zero() {
+		use hickory_net::proto::rr::domain::Name;
+		use hickory_net::proto::rr::rdata::SRV;
+
+		let target: Name = "ts.greenteaspeak.de.".parse().unwrap();
+		let only_zero = vec![SRV::new(10, 0, 9987, target.clone())];
+		let ordered = order_srv_by_priority_weight(&only_zero);
+		assert_eq!(ordered.len(), 1);
+		assert_eq!(ordered[0].port, 9987);
+		assert_eq!(ordered[0].weight, 0);
+
+		let mixed = vec![
+			SRV::new(10, 0, 9987, target.clone()),
+			SRV::new(10, 50, 9988, "other.example.".parse().unwrap()),
+			SRV::new(5, 0, 9990, "first.example.".parse().unwrap()),
+		];
+		let ordered = order_srv_by_priority_weight(&mixed);
+		assert_eq!(ordered.len(), 3);
+		// Priority 5 first
+		assert_eq!(ordered[0].port, 9990);
+		// Then positive weight before weight 0 within priority 10
+		assert_eq!(ordered[1].port, 9988);
+		assert_eq!(ordered[2].port, 9987);
+	}
+
 	#[tokio::test]
 	async fn resolve_localhost() {
 		create_logger();
@@ -503,6 +597,26 @@ mod test {
 		.await
 		.expect("Resolve takes unacceptable long");
 		assert!(res.contains(&format!("37.120.179.68:{}", DEFAULT_PORT).parse().unwrap()));
+	}
+
+	#[tokio::test]
+	async fn resolve_greenteaspeak_via_srv() {
+		create_logger();
+		// Root domain A is the web host (.131); SRV points at ts.*:9987 (.129).
+		// Without weight-0 handling this falls through to the wrong A record.
+		let res: Vec<_> = tokio::time::timeout(
+			Duration::from_secs(10),
+			resolve("greenteaspeak.de".into()).map(|r| r.unwrap()).collect(),
+		)
+		.await
+		.expect("Resolve takes unacceptable long");
+		let expected: SocketAddr = "148.251.103.129:9987".parse().unwrap();
+		assert!(
+			res.contains(&expected),
+			"expected SRV target {}, got {:?}",
+			expected,
+			res
+		);
 	}
 
 	#[tokio::test]

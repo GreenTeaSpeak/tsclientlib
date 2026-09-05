@@ -1065,7 +1065,7 @@ impl OutC2SInit2 {
 impl OutC2SInit4 {
 	pub fn new(
 		version: u32, x: &[u8; 64], n: &[u8; 64], level: u32, random2: &[u8; 100], y: &[u8; 64],
-		alpha: &[u8], omega: &[u8], ip: &str,
+		alpha: &[u8], omega: &[u8], ip: &str, teaspeak: bool,
 	) -> OutPacket {
 		let mut res = OutPacket::new_with_dir(Direction::C2S, Flags::empty(), PacketType::Init);
 		res.mac().copy_from_slice(b"TS3INIT1");
@@ -1078,14 +1078,20 @@ impl OutC2SInit4 {
 		content.write_be(level).unwrap();
 		content.write_all(random2).unwrap();
 		content.write_all(y).unwrap();
+		// TeaSpeak/GreenTeaSpeak expect `ip=unknown`. Official TS3 accepts empty
+		// `ip` or `ip=<addr>`.
 		let ip = if ip.is_empty() { String::new() } else { format!("={}", ip) };
+		// Server checks `cmd.has_switch("teaspeak")` → must be the `-teaspeak`
+		// switch form (Command::enableParm), NOT `teaspeak=1`.
+		let teaspeak_flag = if teaspeak { " -teaspeak" } else { "" };
 		content
 			.write_all(
 				format!(
-					"clientinitiv alpha={} omega={} ot=1 ip{}",
+					"clientinitiv alpha={} omega={} ot=1 ip{}{}",
 					BASE64_STANDARD.encode(alpha),
 					BASE64_STANDARD.encode(omega),
-					ip
+					ip,
+					teaspeak_flag,
 				)
 				.as_bytes(),
 			)

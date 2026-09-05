@@ -91,7 +91,12 @@ impl PacketCodec {
 					match algs::decrypt_fake(&packet).or_else(|_| {
 						if let Some(params) = &mut con.params {
 							// Decrypt the packet
-							algs::decrypt(&packet, gen_id, &params.shared_iv, &mut params.key_cache)
+							algs::decrypt(
+								&packet,
+								gen_id,
+								&params.shared_iv[..params.shared_iv_len],
+								&mut params.key_cache,
+							)
 						} else {
 							// Failed to fake decrypt the packet
 							Err(Error::WrongMac { p_type, generation_id: gen_id, packet_id: id })
@@ -105,7 +110,12 @@ impl PacketCodec {
 					}
 				} else if let Some(params) = &mut con.params {
 					// Decrypt the packet
-					match algs::decrypt(&packet, gen_id, &params.shared_iv, &mut params.key_cache) {
+					match algs::decrypt(
+						&packet,
+						gen_id,
+						&params.shared_iv[..params.shared_iv_len],
+						&mut params.key_cache,
+					) {
 						Ok(r) => r,
 						Err(e) => {
 							con.stream_items.push_back(StreamItem::Error(e));
@@ -147,9 +157,10 @@ impl PacketCodec {
 
 						let item = match InCommandBuf::try_new(dir, c) {
 							Ok(c) => {
-								// initivexpand2 is the ack for the last init packet
+								// initivexpand / initivexpand2 ack the last init packet
 								if con.is_client
-									&& c.data().packet().content().starts_with(b"initivexpand2 ")
+									&& (c.data().packet().content().starts_with(b"initivexpand2 ")
+										|| c.data().packet().content().starts_with(b"initivexpand "))
 								{
 									Resender::ack_packet(con, cx, PacketType::Init, 4);
 								} else if con.is_client
@@ -443,7 +454,7 @@ impl PacketCodec {
 					algs::encrypt(
 						&mut packet,
 						p_id.generation_id,
-						&params.shared_iv,
+						&params.shared_iv[..params.shared_iv_len],
 						&mut params.key_cache,
 					)?;
 				}

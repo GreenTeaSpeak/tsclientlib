@@ -155,12 +155,18 @@ for (msg_name, group) in groups {
 				let mut ids = event.get_id_args("m");
 				if !ids.is_empty() { ids.push_str(", "); }
 				if !event.book_struct.opt { #>
-				let old = self.<#= function_name #>(<#= ids #>&mut events)?
-					.ok_or(Error::RemoveNotFound("<#= book_name #>"))?;
+				// Soft-remove: TeaSpeak channelhide (and races) may reference a channel
+				// that is already gone — ignore instead of failing the whole command.
+				if let Some(old) = self.<#= function_name #>(<#= ids #>&mut events)? {
+				<#
+					create_event(_fmt, event, "Removed", true)?;
+				#>
+				}
 				<# } else { #>
 				let old = self.<#= function_name #>(<#= ids #>&mut events)?;
-				<# }
-				create_event(_fmt, event, "Removed", true)?;
+				<#
+					create_event(_fmt, event, "Removed", true)?;
+				}
 			} else if event.op == RuleOp::Update && !event.book_struct.opt {
 				// Update the object
 				// Functions first

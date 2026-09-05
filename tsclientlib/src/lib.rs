@@ -18,7 +18,7 @@ use std::collections::VecDeque;
 use std::convert::TryInto;
 use std::iter;
 use std::mem;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -40,13 +40,14 @@ use tsproto::resend::ResenderState;
 use tsproto_packets::commands::{CommandItem, CommandParser};
 #[cfg(feature = "audio")]
 use tsproto_packets::packets::InAudioBuf;
-use tsproto_packets::packets::{InCommandBuf, OutCommand, OutPacket, PacketType};
+use tsproto_packets::packets::{Direction, Flags, InCommandBuf, OutCommand, OutPacket, PacketType};
 
 #[cfg(feature = "audio")]
 pub mod audio;
 pub mod prelude;
 pub mod resolver;
 pub mod sync;
+pub mod teaspeak_identity;
 
 // The build environment of tsclientlib.
 git_testament::git_testament!(TESTAMENT);
@@ -64,8 +65,25 @@ pub use tsproto_types::errors::Error as TsError;
 
 /// Wait this time for initserver, in seconds.
 const INITSERVER_TIMEOUT: u64 = 5;
+/// Wait this time for TeaSpeak `handshakeidentityproof`, in seconds.
+const HANDSHAKE_TIMEOUT: u64 = 20;
 
 type Result<T> = std::result::Result<T, Error>;
+
+/// Which protocol flavour to speak after UDP crypto completes.
+///
+/// TeaSpeak needs an identity handshake (`handshakebegin` …) before `clientinit`.
+/// Classic TeamSpeak goes straight to `clientinit`.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum ServerType {
+	/// Classic TeamSpeak 3 — skip TeaSpeak identity handshake.
+	#[default]
+	Teamspeak,
+	/// TeaSpeak / GreenTeaSpeak — always run TEAMSPEAK identity handshake.
+	Teaspeak,
+	/// Run the handshake when the server advertised `teaspeak=1` in `initivexpand2`.
+	Auto,
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct MessageHandle(pub u16);
@@ -128,6 +146,14 @@ pub enum Error {
 	SendPacket(#[source] tsproto::client::Error),
 	#[error("The server changed its identity")]
 	ServerUidMismatch(UidBuf),
+	#[error("TeaSpeak identity handshake failed: {0}")]
+	Handshake(String),
+	#[error("Timeout while waiting for TeaSpeak handshakeidentityproof")]
+	HandshakeTimeout,
+	#[error("Failed to send TeaSpeak handshake command: {0}")]
+	SendHandshake(#[source] tsproto::client::Error),
+	#[error("Failed while waiting for TeaSpeak handshake: {0}")]
+	HandshakeWait(#[source] tsproto::client::Error),
 }
 
 /// The reason for a temporary disconnect.
@@ -271,6 +297,9 @@ struct ConnectedConnection {
 	client: client::Client,
 	cur_return_code: u16,
 	cur_filetransfer_id: u16,
+	/// Last non-zero FT TCP port from `notifystartdownload` / `notifystartupload`.
+	/// Used when a later notify omits or sends `port=0`.
+	known_filetransfer_port: Option<u16>,
 	/// If we are subscribed to the server. This will automatically subscribe to new channels.
 	subscribed: bool,
 	/// If a file stream can be opened, it gets put in here until the tcp
@@ -391,6 +420,8 @@ impl Connection {
 			log_commands: false,
 			log_packets: false,
 			log_udp_packets: false,
+			server_type: ServerType::default(),
+			default_token: Cow::Borrowed(""),
 		}
 	}
 
@@ -490,6 +521,15 @@ impl Connection {
 		);
 		let mut client =
 			client::Client::new(addr, socket, options.identity.as_ref().unwrap().key().clone());
+		// Must be set BEFORE crypto: TeaSpeak/GTS reject clientinitiv without
+		// `teaspeak=1` and answer with `error` instead of `initivexpand2`.
+		client.teaspeak = match options.server_type {
+			ServerType::Teaspeak => true,
+			// Auto: prefer TeaSpeak-compatible clientinitiv. Official TS3
+			// servers typically ignore the unknown argument.
+			ServerType::Auto => true,
+			ServerType::Teamspeak => false,
+		};
 
 		// Logging
 		tsproto::log::add_logger(
@@ -500,7 +540,7 @@ impl Connection {
 		);
 
 		// Create a connection
-		debug!(address = %addr, "Connecting");
+		debug!(address = %addr, teaspeak_clientinitiv = client.teaspeak, "Connecting");
 		client.connect().await.map_err(Error::Connect)?;
 
 		if let Some(server_uid) = &options.server {
@@ -513,6 +553,18 @@ impl Connection {
 			if real_uid != *server_uid {
 				return Err(Error::ServerUidMismatch(real_uid));
 			}
+		}
+
+		// TeaSpeak needs TEAMSPEAK identity handshake after crypto, before clientinit.
+		let need_handshake = match options.server_type {
+			ServerType::Teamspeak => false,
+			ServerType::Teaspeak => true,
+			ServerType::Auto => client.params.as_ref().map(|p| p.teaspeak).unwrap_or(false),
+		};
+		if need_handshake {
+			debug!(server_type = ?options.server_type, "Running TeaSpeak TEAMSPEAK identity handshake");
+			Self::teaspeak_identity_handshake(&mut client, options.identity.as_ref().unwrap())
+				.await?;
 		}
 
 		// Create clientinit packet
@@ -547,7 +599,7 @@ impl Connection {
 			version_sign: Cow::Borrowed(client_version_sign.as_ref()),
 			client_key_offset: counter,
 			phonetic_name: "".into(),
-			default_token: "".into(),
+			default_token: Cow::Borrowed(options.default_token.as_ref()),
 			hardware_id: Cow::Borrowed(options.hardware_id.as_ref()),
 			badges: None,
 			signed_badges: None,
@@ -568,6 +620,95 @@ impl Connection {
 		{
 			Ok(r) => r,
 			Err(_) => Err(Error::InitserverTimeout),
+		}
+	}
+
+	/// TeaSpeak TEAMSPEAK auth (`authentication_method=1`):
+	/// `handshakebegin` → wait `handshakeidentityproof` → `handshakeindentityproof`.
+	async fn teaspeak_identity_handshake(
+		client: &mut client::Client, identity: &Identity,
+	) -> Result<()> {
+		let public_key = teaspeak_identity::public_key_tomcrypt_b64(identity);
+
+		let mut begin =
+			OutCommand::new(Direction::C2S, Flags::empty(), PacketType::Command, "handshakebegin");
+		begin.write_arg("intention", &0);
+		begin.write_arg("authentication_method", &1);
+		begin.write_arg("publicKey", &public_key);
+		client.send_packet(begin.into_packet()).map_err(Error::SendHandshake)?;
+
+		let challenge = match tokio::time::timeout(
+			Duration::from_secs(HANDSHAKE_TIMEOUT),
+			Self::wait_handshake_identity_proof(client),
+		)
+		.await
+		{
+			Ok(r) => r?,
+			Err(_) => return Err(Error::HandshakeTimeout),
+		};
+
+		if challenge.is_empty() {
+			return Err(Error::Handshake("empty identity challenge".into()));
+		}
+
+		let proof = teaspeak_identity::sign_challenge(identity, &challenge);
+		// Server handler typo is intentional: "handshakeindentityproof" (missing 't').
+		let mut proof_cmd = OutCommand::new(
+			Direction::C2S,
+			Flags::empty(),
+			PacketType::Command,
+			"handshakeindentityproof",
+		);
+		proof_cmd.write_arg("proof", &proof);
+		client.send_packet(proof_cmd.into_packet()).map_err(Error::SendHandshake)?;
+
+		Ok(())
+	}
+
+	async fn wait_handshake_identity_proof(client: &mut client::Client) -> Result<String> {
+		loop {
+			let cmd = client
+				.filter_commands(|_, cmd| Ok(Some(cmd)))
+				.await
+				.map_err(Error::HandshakeWait)?;
+			let content = cmd.data().packet().content();
+			let (name, args) = CommandParser::new(content);
+
+			if name == b"error" || name == b"commanderror" {
+				// Surface as handshake failure (unknown command / auth rejected).
+				let mut msg = String::from_utf8_lossy(content).into_owned();
+				for item in args {
+					if let CommandItem::Argument(arg) = item {
+						if arg.name() == b"msg" {
+							if let Ok(s) = arg.value().get_str() {
+								msg = s.into_owned();
+							}
+						}
+					}
+				}
+				return Err(Error::Handshake(msg));
+			}
+
+			if name == b"handshakeidentityproof" {
+				let mut message = String::new();
+				for item in args {
+					match item {
+						CommandItem::NextCommand => break,
+						CommandItem::Argument(arg) if arg.name() == b"message" => {
+							if let Ok(s) = arg.value().get_str() {
+								message = s.into_owned();
+							}
+						}
+						CommandItem::Argument(_) => {}
+					}
+				}
+				return Ok(message);
+			}
+
+			warn!(
+				command = %String::from_utf8_lossy(name),
+				"Expected handshakeidentityproof, dropping command"
+			);
 		}
 	}
 
@@ -596,18 +737,18 @@ impl Connection {
 					return Err(Error::ConnectTs(e.id));
 				}
 				Ok(InMessage::InitServer(initserver)) => {
-					let public_key = {
+					let (public_key, early_license) = {
 						let params = if let Some(r) = &client.params {
 							r
 						} else {
 							return Err(Error::InitserverParamsMissing);
 						};
 
-						params.public_key.clone()
+						(params.public_key.clone(), params.license_type)
 					};
 
 					// Create connection
-					let data = data::Connection::new(public_key, &initserver);
+					let data = data::Connection::new(public_key, &initserver, early_license);
 
 					return Ok((client, data));
 				}
@@ -1149,6 +1290,7 @@ impl Connection {
 						client,
 						cur_return_code: 0,
 						cur_filetransfer_id: 0,
+						known_filetransfer_port: None,
 						subscribed: false,
 						filetransfers: Default::default(),
 						connection_time: OffsetDateTime::now_utc(),
@@ -1328,6 +1470,34 @@ impl Drop for Connection {
 	fn drop(&mut self) { self.cancel_identity_level_increase(); }
 }
 
+/// Classic TeamSpeak 3 default (`serverinstance_filetransfer_port`, also in
+/// `notifystartdownload` examples). Only used when the notify has no usable port.
+const DEFAULT_FILETRANSFER_PORT: u16 = 30033;
+/// TeaSpeak / GreenTeaSpeak default FT TCP port when notify port is missing.
+const TEASPEAK_DEFAULT_FILETRANSFER_PORT: u16 = 30303;
+
+/// Resolve the TCP endpoint for a file transfer.
+///
+/// - IP: TeaSpeak often reports `ip=0.0.0.0` (or omits it) → use the voice peer IP.
+/// - Port: prefer `notifystart{down,up}load` `port` (usually 30033 / 30303). If it is
+///   0 or equals the voice UDP port (almost never a valid FT TCP port), use
+///   `fallback_port` (last known FT port, else server-type default).
+fn resolve_filetransfer_addr(
+	reported_ip: Option<IpAddr>, reported_port: u16, voice_peer: SocketAddr,
+	fallback_port: u16,
+) -> SocketAddr {
+	let ip = match reported_ip {
+		Some(ip) if !ip.is_unspecified() => ip,
+		_ => voice_peer.ip(),
+	};
+	let port = if reported_port == 0 || reported_port == voice_peer.port() {
+		fallback_port
+	} else {
+		reported_port
+	};
+	SocketAddr::new(ip, port)
+}
+
 impl<'a> Stream for EventStream<'a> {
 	type Item = Result<StreamItem>;
 	fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Option<Self::Item>> {
@@ -1336,6 +1506,44 @@ impl<'a> Stream for EventStream<'a> {
 }
 
 impl ConnectedConnection {
+	/// Pick FT TCP addr from notify IP/port, remembering a good port for later fallbacks.
+	fn filetransfer_tcp_addr(
+		&mut self, reported_ip: Option<IpAddr>, reported_port: u16, direction: &str,
+	) -> SocketAddr {
+		let voice_peer = self.client.address;
+		let is_teaspeak = self.client.params.as_ref().map(|p| p.teaspeak).unwrap_or(false);
+		let fallback_port = self.known_filetransfer_port.unwrap_or(if is_teaspeak {
+			TEASPEAK_DEFAULT_FILETRANSFER_PORT
+		} else {
+			DEFAULT_FILETRANSFER_PORT
+		});
+		let addr =
+			resolve_filetransfer_addr(reported_ip, reported_port, voice_peer, fallback_port);
+		if reported_port != 0 && reported_port != voice_peer.port() {
+			self.known_filetransfer_port = Some(reported_port);
+		}
+		if reported_port == 0 || reported_port == voice_peer.port() {
+			warn!(
+				reported_ip = ?reported_ip,
+				reported_port,
+				voice_port = voice_peer.port(),
+				%addr,
+				fallback_port,
+				"{} notify port missing/invalid; using fallback",
+				direction
+			);
+		}
+		info!(
+			%addr,
+			reported_ip = ?reported_ip,
+			reported_port,
+			final_port = addr.port(),
+			"Starting file {} TCP",
+			direction
+		);
+		addr
+	}
+
 	fn handle_command(
 		&mut self, book: &mut data::Connection, stream_items: &mut VecDeque<Result<StreamItem>>,
 		options: &mut ConnectOptions, cmd: InCommandBuf,
@@ -1371,16 +1579,19 @@ impl ConnectedConnection {
 		} else if let InMessage::FileDownload(msg) = &msg {
 			for msg in msg.iter() {
 				let ft_id = FiletransferHandle(msg.client_filetransfer_id);
-				let ip = msg.ip.unwrap_or_else(|| self.client.address.ip());
-				let addr = SocketAddr::new(ip, msg.port);
+				let addr = self.filetransfer_tcp_addr(msg.ip, msg.port, "download");
 				let key = msg.filetransfer_key.clone();
 				let size = msg.size;
 
 				let fut = Box::new(async move {
 					let addr = addr;
 					let key = key;
-					let mut stream =
-						TcpStream::connect(&addr).await.map_err(Error::FiletransferIo)?;
+					let mut stream = TcpStream::connect(&addr).await.map_err(|e| {
+						Error::FiletransferIo(std::io::Error::new(
+							e.kind(),
+							format!("file transfer connect to {addr} failed: {e}"),
+						))
+					})?;
 					stream.write_all(key.as_bytes()).await.map_err(Error::FiletransferIo)?;
 					stream.flush().await.map_err(Error::FiletransferIo)?;
 					Ok(stream)
@@ -1397,16 +1608,19 @@ impl ConnectedConnection {
 		} else if let InMessage::FileUpload(msg) = &msg {
 			for msg in msg.iter() {
 				let ft_id = FiletransferHandle(msg.client_filetransfer_id);
-				let ip = msg.ip.unwrap_or_else(|| self.client.address.ip());
-				let addr = SocketAddr::new(ip, msg.port);
+				let addr = self.filetransfer_tcp_addr(msg.ip, msg.port, "upload");
 				let key = msg.filetransfer_key.clone();
 				let seek_position = msg.seek_position;
 
 				let fut = Box::new(async move {
 					let addr = addr;
 					let key = key;
-					let mut stream =
-						TcpStream::connect(&addr).await.map_err(Error::FiletransferIo)?;
+					let mut stream = TcpStream::connect(&addr).await.map_err(|e| {
+						Error::FiletransferIo(std::io::Error::new(
+							e.kind(),
+							format!("file transfer connect to {addr} failed: {e}"),
+						))
+					})?;
 					stream.write_all(key.as_bytes()).await.map_err(Error::FiletransferIo)?;
 					stream.flush().await.map_err(Error::FiletransferIo)?;
 					Ok(stream)
@@ -1579,6 +1793,18 @@ impl ConnectedConnection {
 					warn!(%error, "Failed to send channel subscribe packet");
 				}
 			}
+		} else if let InMessage::ChannelShow(msg) = &msg {
+			// TeaSpeak: newly visible channel after permission grant — subscribe like create.
+			if self.subscribed {
+				let packet = c2s::OutChannelSubscribeMessage::new(
+					&mut msg
+						.iter()
+						.map(|msg| c2s::OutChannelSubscribePart { channel_id: msg.channel_id }),
+				);
+				if let Err(error) = self.client.send_packet(packet.into_packet()) {
+					warn!(%error, "Failed to send channel subscribe packet for channelshow");
+				}
+			}
 		} else if let InMessage::ClientLeftView(msg) = &msg {
 			// Handle server restarts
 			for msg in msg.iter() {
@@ -1705,6 +1931,9 @@ pub struct ConnectOptions {
 	log_commands: bool,
 	log_packets: bool,
 	log_udp_packets: bool,
+	server_type: ServerType,
+	/// Privilege key / token passed as `client_default_token` in `clientinit`.
+	default_token: Cow<'static, str>,
 }
 
 impl ConnectOptions {
@@ -1904,6 +2133,29 @@ impl ConnectOptions {
 		self
 	}
 
+	/// Privilege key / token applied on connect (`client_default_token`).
+	///
+	/// Alias: [`Self::token`].
+	#[inline]
+	pub fn default_token<S: Into<Cow<'static, str>>>(mut self, token: S) -> Self {
+		self.default_token = token.into();
+		self
+	}
+
+	/// Privilege key / token applied on connect (`client_default_token`).
+	#[inline]
+	pub fn token<S: Into<Cow<'static, str>>>(self, token: S) -> Self { self.default_token(token) }
+
+	/// Select TeamSpeak vs TeaSpeak connect behaviour.
+	///
+	/// # Default
+	/// [`ServerType::Teamspeak`] (backwards compatible — no identity handshake).
+	#[inline]
+	pub fn server_type(mut self, server_type: ServerType) -> Self {
+		self.server_type = server_type;
+		self
+	}
+
 	/// Connect to the server in a muted state.
 	///
 	/// # Example
@@ -2023,6 +2275,10 @@ impl ConnectOptions {
 	}
 	#[inline]
 	pub fn get_password(&self) -> Option<&str> { self.password.as_ref().map(AsRef::as_ref) }
+	#[inline]
+	pub fn get_default_token(&self) -> &str { &self.default_token }
+	#[inline]
+	pub fn get_server_type(&self) -> ServerType { self.server_type }
 	#[inline]
 	pub fn get_input_muted(&self) -> bool { self.input_muted }
 	#[inline]

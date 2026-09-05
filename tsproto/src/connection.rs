@@ -13,6 +13,7 @@ use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
 use tracing::{Span, info_span};
 use tsproto_packets::packets::*;
+use tsproto_types::LicenseType;
 use tsproto_types::crypto::EccKeyPubP256;
 
 use crate::packet_codec::PacketCodec;
@@ -44,11 +45,24 @@ pub struct ConnectedParams {
 	pub c_id: u16,
 	/// If voice packets should be encrypted
 	pub voice_encryption: bool,
+	/// Set when the server announced TeaSpeak (`teaspeak=1` in `initivexpand2`).
+	pub teaspeak: bool,
+	/// License id captured during crypto handshake:
+	/// - TeaSpeak / GreenTeaSpeak: `license` / `lt` in `initivexpand`
+	/// - Classic TeamSpeak 3: from the Server/Ts5Server block in `initivexpand2` `l=`
+	///   (NoLicense, Athp, Aal, …). InitServer often omits both fields on classic TS3.
+	pub license_type: Option<LicenseType>,
 
 	/// The public key of the other side.
 	pub public_key: EccKeyPubP256,
 	/// The iv used to encrypt and decrypt packets.
+	///
+	/// TeamSpeak 3.1 / `initivexpand2` uses 64 bytes. Classic TeaSpeak /
+	/// GreenTeaSpeak (`initivexpand`) uses only the first 20 bytes — see
+	/// [`Self::shared_iv_len`].
 	pub shared_iv: [u8; 64],
+	/// How many leading bytes of [`Self::shared_iv`] participate in key derivation.
+	pub shared_iv_len: usize,
 	/// The mac used for unencrypted packets.
 	pub shared_mac: [u8; 8],
 	/// Cached key and nonce per packet type and for server to client (without
@@ -136,12 +150,20 @@ impl Default for CachedKey {
 
 impl ConnectedParams {
 	/// Fills the parameters for a connection with their default state.
-	pub fn new(public_key: EccKeyPubP256, shared_iv: [u8; 64], shared_mac: [u8; 8]) -> Self {
+	///
+	/// `shared_iv_len` is 64 for TeamSpeak 3.1 (`initivexpand2`) and 20 for
+	/// classic TeaSpeak / GreenTeaSpeak (`initivexpand`).
+	pub fn new(
+		public_key: EccKeyPubP256, shared_iv: [u8; 64], shared_mac: [u8; 8], shared_iv_len: usize,
+	) -> Self {
 		Self {
 			c_id: 0,
 			voice_encryption: true,
+			teaspeak: false,
+			license_type: None,
 			public_key,
 			shared_iv,
+			shared_iv_len,
 			shared_mac,
 			key_cache: Default::default(),
 		}

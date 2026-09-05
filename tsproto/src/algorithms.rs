@@ -9,7 +9,7 @@ use omnom::WriteExt;
 use quicklz::CompressionLevel;
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
-use tsproto_types::crypto::{EccKeyPrivEd25519, EccKeyPubP256};
+use tsproto_types::crypto::{EccKeyPrivEd25519, EccKeyPrivP256, EccKeyPubP256};
 
 use crate::connection::CachedKey;
 use crate::{Error, Result};
@@ -113,14 +113,14 @@ pub fn compress_and_split(is_client: bool, packet: OutPacket) -> Vec<OutPacket> 
 }
 
 fn create_key_nonce(
-	p_type: PacketType, c_id: Option<u16>, p_id: u16, generation_id: u32, iv: &[u8; 64],
+	p_type: PacketType, c_id: Option<u16>, p_id: u16, generation_id: u32, iv: &[u8],
 	cache: &mut [[CachedKey; 2]; 8],
 ) -> (GenericArray<u8, U16>, GenericArray<u8, U16>) {
 	// Check if this generation is cached
 	let cache = &mut cache[p_type.to_usize().unwrap()][if c_id.is_some() { 1 } else { 0 }];
 	if cache.generation_id != generation_id {
-		// Update the cache
-		let mut temp = [0; 70];
+		// Update the cache — IV length is 64 (TS 3.1) or 20 (classic TeaSpeak).
+		let mut temp = [0u8; 70];
 		if c_id.is_some() {
 			temp[0] = 0x31;
 		} else {
@@ -128,9 +128,10 @@ fn create_key_nonce(
 		}
 		temp[1] = p_type.to_u8().unwrap();
 		(&mut temp[2..6]).write_be(generation_id).unwrap();
-		temp[6..].copy_from_slice(iv);
+		let iv_len = iv.len().min(64);
+		temp[6..6 + iv_len].copy_from_slice(&iv[..iv_len]);
 
-		let keynonce = Sha256::digest(&temp[..]);
+		let keynonce = Sha256::digest(&temp[..6 + iv_len]);
 		let keynonce = keynonce.as_slice();
 		cache.generation_id = generation_id;
 		cache.key.copy_from_slice(&keynonce[..16]);
@@ -162,7 +163,7 @@ pub fn encrypt_fake(packet: &mut OutPacket) -> Result<()> {
 }
 
 pub fn encrypt(
-	packet: &mut OutPacket, generation_id: u32, iv: &[u8; 64], cache: &mut [[CachedKey; 2]; 8],
+	packet: &mut OutPacket, generation_id: u32, iv: &[u8], cache: &mut [[CachedKey; 2]; 8],
 ) -> Result<()> {
 	let header = packet.header();
 	let (key, nonce) = create_key_nonce(
@@ -199,7 +200,7 @@ pub fn decrypt_fake(packet: &InPacket) -> Result<Vec<u8>> {
 }
 
 pub fn decrypt(
-	packet: &InPacket, generation_id: u32, iv: &[u8; 64], cache: &mut [[CachedKey; 2]; 8],
+	packet: &InPacket, generation_id: u32, iv: &[u8], cache: &mut [[CachedKey; 2]; 8],
 ) -> Result<Vec<u8>> {
 	let header = packet.header();
 	let (key, nonce) = create_key_nonce(
@@ -219,7 +220,7 @@ pub fn decrypt(
 	})
 }
 
-/// Compute shared iv and shared mac.
+/// Compute shared iv and shared mac for TeamSpeak 3.1 (`initivexpand2`).
 pub fn compute_iv_mac(
 	alpha: &[u8; 10], beta: &[u8; 54], our_key: &EccKeyPrivEd25519, other_key: &EdwardsPoint,
 ) -> ([u8; 64], [u8; 8]) {
@@ -235,6 +236,27 @@ pub fn compute_iv_mac(
 	let mut shared_mac = [0; 8];
 	shared_mac.copy_from_slice(&Sha1::digest(shared_iv).as_slice()[..8]);
 	(shared_iv, shared_mac)
+}
+
+/// Classic TeaSpeak / GreenTeaSpeak crypto from `initivexpand` (P-256 ECDH).
+///
+/// Matches `CryptHandler::setupSharedSecret`: SHA1(ecdh) XOR (alpha‖beta) → 20-byte IV.
+pub fn compute_iv_mac_teaspeak(
+	alpha: &[u8; 10], beta: &[u8; 10], our_key: EccKeyPrivP256, other_key: EccKeyPubP256,
+) -> ([u8; 64], [u8; 8], usize) {
+	let shared = our_key.create_shared_secret(other_key);
+	let secret_hash = Sha1::digest(shared.raw_secret_bytes());
+	let mut iv20 = [0u8; 20];
+	iv20[..10].copy_from_slice(alpha);
+	iv20[10..].copy_from_slice(beta);
+	for i in 0..20 {
+		iv20[i] ^= secret_hash[i];
+	}
+	let mut shared_iv = [0u8; 64];
+	shared_iv[..20].copy_from_slice(&iv20);
+	let mut shared_mac = [0u8; 8];
+	shared_mac.copy_from_slice(&Sha1::digest(iv20).as_slice()[..8]);
+	(shared_iv, shared_mac, 20)
 }
 
 pub fn hash_cash(key: &EccKeyPubP256, level: u8) -> u64 {
