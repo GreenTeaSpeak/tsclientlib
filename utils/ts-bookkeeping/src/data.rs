@@ -149,7 +149,22 @@ impl Connection {
 							id: msg.invoker_id,
 							uid: msg.invoker_uid.clone(),
 						},
-						message: msg.message.to_string(),
+						message: msg.message.clone().unwrap_or_default(),
+					});
+					handled = true;
+				}
+			}
+			// TeaSpeak / GTS: same payload as ClientPoke but on PacketType::Command.
+			InMessage::ClientPokeNormal(msg) => {
+				for msg in msg.iter() {
+					events.push(Event::Message {
+						target: MessageTarget::Poke(msg.invoker_id),
+						invoker: Invoker {
+							name: msg.invoker_name.clone(),
+							id: msg.invoker_id,
+							uid: msg.invoker_uid.clone(),
+						},
+						message: msg.message.clone().unwrap_or_default(),
 					});
 					handled = true;
 				}
