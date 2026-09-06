@@ -36,11 +36,17 @@ impl InMessage {
 				let group: Vec<_> = group.collect();
 				let (msg, group) = group.split_last().unwrap();
 				#>
-			b"<#= notify #>" => <# for msg in group {
-			#>if let Ok(r) = In<#= msg.name #>::new(header, args.clone()) {
-				Ok(InMessage::<#= msg.name #>(r))
-			} else <#
-			} #>{
+			b"<#= notify #>" => {
+				// Prefer the matching packet type (Command vs CommandLow). Only fall
+				// through on WrongPacketType so attribute errors from TeaSpeak/GTS
+				// are not masked by a second WrongPacketType from the other variant.
+				<# for msg in group { #>
+				match In<#= msg.name #>::new(header, args.clone()) {
+					Ok(r) => return Ok(InMessage::<#= msg.name #>(r)),
+					Err(ParseError::WrongPacketType(_)) => {}
+					Err(e) => return Err(e),
+				}
+				<# } #>
 				Ok(InMessage::<#= msg.name #>(In<#= msg.name #>::new(header, args)?))
 			}
 			<# } #>
